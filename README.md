@@ -33,3 +33,6 @@ cargo run --release
 ## Wiring
 
 We're going to use GPIO 10 as the keyboard input, and GPIO 9 as the big LED output
+
+## Development notes
+This is based on https://github.com/rp-rs/rp2040-project-template/
