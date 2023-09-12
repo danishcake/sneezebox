@@ -11,10 +11,12 @@
 //!
 //! See the `Cargo.toml` file for Copyright and license details.
 //!
+use embedded_hal::digital::v2::OutputPin;
 ///!https://docs.rs/crate/rp-pico/latest/source/examples/pico_usb_twitchy_mouse.rs
 // The entry macro, defining the entrypoint of the application
 use rp_pico::entry;
 
+use rp_pico::hal::gpio::FunctionSio;
 // The macro for marking our interrupt functions
 use rp_pico::hal::pac::interrupt;
 
@@ -73,12 +75,13 @@ fn main() -> ! {
     .unwrap();
 
     // Workaround for erata 5
-    #[cfg(feature = "rp2040-e5")]
-    {
-        let sio = hal::Sio::new(pac.SIO);
-        let _pins =
-            rp_pico::Pins::new(pac.IO_BANK0, pac.PADS_BANK0, sio.gpio_bank0, &mut pac.RESETS);
-    }
+    let sio = hal::Sio::new(pac.SIO);
+    let pins = rp_pico::Pins::new(pac.IO_BANK0, pac.PADS_BANK0, sio.gpio_bank0, &mut pac.RESETS);
+    let mut led_pin: hal::gpio::Pin<
+        hal::gpio::bank0::Gpio25,
+        FunctionSio<hal::gpio::SioOutput>,
+        hal::gpio::PullDown,
+    > = pins.led.into_push_pull_output();
 
     // Set up the USB driver
     let usb_bus = UsbBusAllocator::new(hal::usb::UsbBus::new(
@@ -110,7 +113,7 @@ fn main() -> ! {
         .manufacturer("BAE Systems Digital Intelligence")
         .product("SNEEZE BUTTON 2000")
         .serial_number("00000000001")
-        .device_class(0)
+        .device_class(0x03)
         .build();
     unsafe {
         // Note (safety): This is safe as interrupts haven't been started yet
@@ -125,18 +128,23 @@ fn main() -> ! {
     let mut delay = cortex_m::delay::Delay::new(core.SYST, clocks.system_clock.freq().to_Hz());
 
     loop {
-        delay.delay_ms(100);
+        led_pin.set_high().unwrap();
+        delay.delay_ms(500);
 
         // https://docs.rs/usbd-hid/latest/usbd_hid/descriptor/struct.KeyboardReport.html
         // https://files.microscan.com/helpfiles/ms4_help_file/ms-4_help-02-46.html
-        // Indicate S button down
+        // https://www.win.tue.nl/~aeb/linux/kbd/scancodes-14.html
+        // Indicate A button down
         let rep_down = KeyboardReport {
             modifier: 0u8, // 0x01 => left control
             reserved: 0u8, // Reserved
             leds: 0u8,     // No LEDs lit
-            keycodes: [0x73u8, 0u8, 0u8, 0u8, 0u8, 0u8],
+            keycodes: [0x04u8, 0u8, 0u8, 0u8, 0u8, 0u8],
         };
         push_keyboard_report(rep_down).unwrap_or(0);
+
+        led_pin.set_low().unwrap();
+        delay.delay_ms(500);
 
         // Indicate all keys are up
         let rep_up = KeyboardReport {
