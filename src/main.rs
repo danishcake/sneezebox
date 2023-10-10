@@ -1,31 +1,25 @@
 #![no_std]
 #![no_main]
 
-//! # Pico USB 'Twitchy' Mouse Example
-//!
-//! Creates a USB HID Class Pointing device (i.e. a virtual mouse) on a Pico
-//! board, with the USB driver running in the main thread.
-//!
-//! It generates movement reports which will twitch the cursor up and down by a
-//! few pixels, several times a second.
-//!
-//! See the `Cargo.toml` file for Copyright and license details.
-//!
-use embedded_hal::digital::v2::OutputPin;
+///! Baseed on the USB twitchy mouse example and the 'rusty-keys' firmware
+///!https://github.com/KOBA789/rusty-keys/blob/7194a0ec3bf5656610075125e239bd3b941fbad4/firmware/keyboard/src/bin/simple.rs#L24
 ///!https://docs.rs/crate/rp-pico/latest/source/examples/pico_usb_twitchy_mouse.rs
 // The entry macro, defining the entrypoint of the application
 use rp_pico::entry;
 
-use rp_pico::hal::gpio::FunctionSio;
+// Clocks
+use rp_pico::hal::Clock;
+
+// Pin traits
+use embedded_hal::digital::v2::InputPin;
+use embedded_hal::digital::v2::OutputPin;
+
 // The macro for marking our interrupt functions
 use rp_pico::hal::pac::interrupt;
 
 // Ensure we halt the program on panic (if we don't mention this crate it won't
 // be linked)
-use panic_halt as _;
-
-// Pull in any important traits
-use rp_pico::hal::prelude::*;
+use panic_probe as _;
 
 // A shorter alias for the Peripheral Access Crate, which provides low-level
 // register access
@@ -42,6 +36,15 @@ use usb_device::{class_prelude::*, prelude::*};
 use usbd_hid::descriptor::generator_prelude::*;
 use usbd_hid::descriptor::KeyboardReport;
 use usbd_hid::hid_class::HIDClass;
+use usbd_hid::hid_class::HidClassSettings;
+use usbd_hid::hid_class::HidCountryCode;
+use usbd_hid::hid_class::HidProtocol;
+use usbd_hid::hid_class::HidSubClass;
+use usbd_hid::hid_class::ProtocolModeConfig;
+
+// Debug printing
+use defmt::*;
+use defmt_rtt as _;
 
 /// The USB Device Driver (shared with the interrupt).
 static mut USB_DEVICE: Option<UsbDevice<hal::usb::UsbBus>> = None;
@@ -54,8 +57,11 @@ static mut USB_HID: Option<HIDClass<hal::usb::UsbBus>> = None;
 
 #[entry]
 fn main() -> ! {
+    debug!("SB:init start");
+
     // Grab our singleton objects
     let mut pac = pac::Peripherals::take().unwrap();
+    let core = pac::CorePeripherals::take().unwrap();
 
     // Set up the watchdog driver - needed by the clock setup code
     let mut watchdog = hal::Watchdog::new(pac.WATCHDOG);
@@ -74,14 +80,13 @@ fn main() -> ! {
     .ok()
     .unwrap();
 
-    // Workaround for erata 5
+    // Obtain LED pin, button LED pin and button state pin
     let sio = hal::Sio::new(pac.SIO);
     let pins = rp_pico::Pins::new(pac.IO_BANK0, pac.PADS_BANK0, sio.gpio_bank0, &mut pac.RESETS);
-    let mut led_pin: hal::gpio::Pin<
-        hal::gpio::bank0::Gpio25,
-        FunctionSio<hal::gpio::SioOutput>,
-        hal::gpio::PullDown,
-    > = pins.led.into_push_pull_output();
+
+    let mut onboard_led_pin = pins.led.into_push_pull_output();
+    let mut button_led_pin = pins.gpio10.into_push_pull_output();
+    let button_in_pin = pins.gpio9.into_pull_up_input();
 
     // Set up the USB driver
     let usb_bus = UsbBusAllocator::new(hal::usb::UsbBus::new(
@@ -91,18 +96,27 @@ fn main() -> ! {
         true,
         &mut pac.RESETS,
     ));
-    unsafe {
+    // Move the USB driver to a global location, as it is required to be alive during
+    // interrupts. We are promising to the compiler not to take mutable access to this
+    // global variable whilst this reference exists.
+    let bus_ref = unsafe {
         // Note (safety): This is safe as interrupts haven't been started yet
         USB_BUS = Some(usb_bus);
-    }
+        USB_BUS.as_ref().unwrap()
+    };
 
-    // Grab a reference to the USB Bus allocator. We are promising to the
-    // compiler not to take mutable access to this global variable whilst this
-    // reference exists!
-    let bus_ref = unsafe { USB_BUS.as_ref().unwrap() };
-
-    // Set up the USB HID Class Device driver, providing Mouse Reports at 100Hz
-    let usb_hid = HIDClass::new(bus_ref, KeyboardReport::desc(), 10);
+    // Set up the USB HID Class Device driver, providing keyboard Reports at 100Hz
+    let usb_hid = HIDClass::new_ep_in_with_settings(
+        bus_ref,
+        KeyboardReport::desc(),
+        10,
+        HidClassSettings {
+            subclass: HidSubClass::NoSubClass,
+            protocol: HidProtocol::Keyboard,
+            config: ProtocolModeConfig::ForceReport,
+            locale: HidCountryCode::NotSupported,
+        },
+    );
     unsafe {
         // Note (safety): This is safe as interrupts haven't been started yet.
         USB_HID = Some(usb_hid);
@@ -111,9 +125,10 @@ fn main() -> ! {
     // Create a USB device with a fake VID and PID
     let usb_dev = UsbDeviceBuilder::new(bus_ref, UsbVidPid(0x8008, 0x5000))
         .manufacturer("BAE Systems Digital Intelligence")
-        .product("SNEEZE BUTTON 2000")
+        .product("SNEEZE BUTTON 2001")
         .serial_number("00000000001")
-        .device_class(0x03)
+        .device_class(0x00)
+        .device_sub_class(0x00)
         .build();
     unsafe {
         // Note (safety): This is safe as interrupts haven't been started yet
@@ -124,39 +139,76 @@ fn main() -> ! {
         // Enable the USB interrupt
         pac::NVIC::unmask(hal::pac::Interrupt::USBCTRL_IRQ);
     };
-    let core = pac::CorePeripherals::take().unwrap();
+
     let mut delay = cortex_m::delay::Delay::new(core.SYST, clocks.system_clock.freq().to_Hz());
 
+    debug!("SB:init complete");
+
+    let mut debounce_count = 0u8;
+    let debounce_time_ms = 10u8;
+    let mut debounce_state = false;
+
     loop {
-        led_pin.set_high().unwrap();
-        delay.delay_ms(500);
-
-        // https://docs.rs/usbd-hid/latest/usbd_hid/descriptor/struct.KeyboardReport.html
-        // https://files.microscan.com/helpfiles/ms4_help_file/ms-4_help-02-46.html
-        // https://www.win.tue.nl/~aeb/linux/kbd/scancodes-14.html
-        // Indicate A button down
-        let rep_down = KeyboardReport {
-            modifier: 0u8, // 0x01 => left control
-            reserved: 0u8, // Reserved
-            leds: 0u8,     // No LEDs lit
-            keycodes: [0x04u8, 0u8, 0u8, 0u8, 0u8, 0u8],
+        let last_debounce_state = debounce_state;
+        match button_in_pin.is_low() {
+            Ok(true) => {
+                if debounce_count < debounce_time_ms {
+                    debounce_count += 1;
+                }
+                if debounce_count == debounce_time_ms {
+                    debounce_state = true
+                }
+            }
+            Ok(false) | Err(_) => {
+                if debounce_count > 0 {
+                    debounce_count -= 1;
+                }
+                if debounce_count == 0 {
+                    debounce_state = false;
+                }
+            }
         };
-        push_keyboard_report(rep_down).unwrap_or(0);
 
-        led_pin.set_low().unwrap();
-        delay.delay_ms(500);
+        match (debounce_state, last_debounce_state) {
+            (true, false) => {
+                debug!("SB:Transition high");
+                onboard_led_pin.set_high().unwrap_or_default();
+                button_led_pin.set_high().unwrap_or_default();
 
-        // Indicate all keys are up
-        let rep_up = KeyboardReport {
-            modifier: 0u8, // 0x01 => left control
-            reserved: 0u8, // Reserved
-            leds: 0u8,     // No LEDs lit
-            keycodes: [0u8, 0u8, 0u8, 0u8, 0u8, 0u8],
-        };
-        push_keyboard_report(rep_up).unwrap_or(0);
+                // Indicate alt-control-NUM3
+                let rep_down = KeyboardReport {
+                    modifier: 0x05u8,                          // 0x01 => left control, 0x04 => left alt
+                    reserved: 0u8,                             // Reserved
+                    leds: 0u8,                                 // No LEDs lit
+                    keycodes: [91u8, 0u8, 0u8, 0u8, 0u8, 0u8], // KP3
+                };
+                push_keyboard_report(rep_down).unwrap_or_default();
+            }
+            (false, true) => {
+                debug!("SB:Transition low");
+                onboard_led_pin.set_low().unwrap_or_default();
+                button_led_pin.set_low().unwrap_or_default();
+
+                // Indicate all keys are up
+                let rep_up = KeyboardReport {
+                    modifier: 0u8, // 0x01 => left control
+                    reserved: 0u8, // Reserved
+                    leds: 0u8,     // No LEDs lit
+                    keycodes: [0u8, 0u8, 0u8, 0u8, 0u8, 0u8],
+                };
+                push_keyboard_report(rep_up).unwrap_or(0);
+            }
+            _ => { /* No change */ }
+        }
+
+        delay.delay_ms(1);
     }
 }
 
+/// Send a USB keyboard report
+/// https://docs.rs/usbd-hid/latest/usbd_hid/descriptor/struct.KeyboardReport.html
+/// https://files.microscan.com/helpfiles/ms4_help_file/ms-4_help-02-46.html
+/// https://www.win.tue.nl/~aeb/linux/kbd/scancodes-14.html
 fn push_keyboard_report(report: KeyboardReport) -> Result<usize, usb_device::UsbError> {
     critical_section::with(|_| unsafe {
         // Now interrupts are disabled, grab the global variable and, if
@@ -171,7 +223,8 @@ fn push_keyboard_report(report: KeyboardReport) -> Result<usize, usb_device::Usb
 #[allow(non_snake_case)]
 #[interrupt]
 unsafe fn USBCTRL_IRQ() {
-    // Handle USB request
+    debug!("SB:usb int"); // Not a good idea to log from interrupt handler...
+                          // Handle USB request
     let usb_dev = USB_DEVICE.as_mut().unwrap();
     let usb_hid = USB_HID.as_mut().unwrap();
     usb_dev.poll(&mut [usb_hid]);
