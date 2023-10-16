@@ -11,15 +11,15 @@ Pogo pins:
 1.0mm diameter tube, 1.3mm diameter head. Length 16.5mm
 Up to 2.5mm of spring movement.
 
-Our model is 3mm thick
+Our model is 5mm thick
 
         |
         | 5mm
 |-------|-----
-| 3mm   |
+| 5mm   |
 |-------|-----
-        | 8mm
+        | 6mm
         |
         V
 
-Mount the print with a 6mm standoff. The standoff diameter is 2.1mm, so use an m2 bolt. I could probably print one of these, or even incorporate it into the print...
+Mount the print with a 5mm standoff. The standoff diameter is 2.1mm, so use an m2 bolt. I could probably print one of these, or even incorporate it into the print...
